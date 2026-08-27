@@ -1,0 +1,11 @@
+[Unit]
+Description=Docker image and stopped container cleaner
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/docker-cleaner \
+    --delete \
+    --image-retention 168 \
+    --stopped-retention 720

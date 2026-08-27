@@ -1,0 +1,12 @@
+---
+- name: Docker cleaner
+  include_role:
+    name: zver.systemd-service
+  vars:
+    systemd_service_name: docker-cleaner
+    systemd_service_template: templates/{{ systemd_service_name }}.service.j2
+    systemd_service_timer_template: templates/{{ systemd_service_name }}.timer.j2
+    systemd_service_files:
+      - src: files/{{ systemd_service_name }}
+        dest: /usr/local/bin/{{ systemd_service_name }}
+        mode: "0755"

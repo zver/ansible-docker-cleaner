@@ -1,0 +1,1034 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+###############################################################################
+# docker-image-cleaner
+#
+# Cleans old stopped Docker containers and/or unused Docker images.
+#
+# By default the script runs in dry-run mode.
+# Actual deletion requires the explicit --delete option.
+#
+# Retention periods are specified in HOURS.
+#
+# Examples:
+#
+#   docker-image-cleaner
+#       Show help.
+#
+#   docker-image-cleaner --image-retention 168
+#       Dry-run: show images unused for more than 168 hours.
+#
+#   docker-image-cleaner --stopped-retention 720
+#       Dry-run: show stopped containers older than 720 hours.
+#
+#   docker-image-cleaner \
+#       --image-retention 168 \
+#       --stopped-retention 720
+#       Dry-run for both policies.
+#
+#   docker-image-cleaner \
+#       --delete \
+#       --image-retention 168 \
+#       --stopped-retention 720
+#       Actually remove matching objects.
+#
+###############################################################################
+
+###############################################################################
+# Defaults
+###############################################################################
+
+# Empty means that the corresponding cleanup policy is disabled.
+IMAGE_RETENTION_HOURS=""
+STOPPED_RETENTION_HOURS=""
+
+# Safety default:
+# no objects are deleted unless --delete is explicitly specified.
+DRY_RUN=true
+
+###############################################################################
+# Paths
+###############################################################################
+
+STATE_DIR="/var/lib/docker-image-cleaner"
+STATE_FILE="${STATE_DIR}/state"
+
+LOG_FILE="/var/log/docker-image-cleaner.log"
+LOCK_FILE="/run/docker-image-cleaner.lock"
+
+###############################################################################
+# Help
+###############################################################################
+
+usage() {
+    cat <<'EOF'
+
+Docker Image Cleaner
+====================
+
+This script removes old stopped Docker containers and/or Docker images
+according to explicitly specified retention periods.
+
+Retention periods are specified in HOURS.
+
+IMPORTANT:
+  - The script is DRY-RUN by default.
+  - Nothing is deleted unless --delete is explicitly specified.
+  - Running containers are NEVER removed.
+  - Images referenced by running containers are NEVER removed.
+  - An image referenced by a stopped container is kept until that
+    container is removed.
+  - Docker Compose containers are handled automatically through their
+    standard Docker labels.
+
+USAGE
+
+  docker-image-cleaner [OPTIONS]
+
+
+OPTIONS
+
+  --image-retention HOURS
+
+      Enable Docker image cleanup.
+
+      Images that are not referenced by any container and whose last
+      known use is older than HOURS will become candidates for removal.
+
+      Example:
+
+          docker-image-cleaner --image-retention 168
+
+      168 hours = 7 days.
+
+
+  --stopped-retention HOURS
+
+      Enable cleanup of stopped Docker containers.
+
+      Stopped containers whose stopped time is older than HOURS will
+      become candidates for removal.
+
+      Example:
+
+          docker-image-cleaner --stopped-retention 720
+
+      720 hours = 30 days.
+
+
+  --delete
+
+      Actually delete matching containers/images.
+
+      Without this option the script only performs a dry-run.
+
+      Example:
+
+          docker-image-cleaner \
+              --delete \
+              --image-retention 168
+
+
+  --dry-run
+
+      Explicitly select dry-run mode.
+
+      This is the default mode.
+
+      Example:
+
+          docker-image-cleaner \
+              --dry-run \
+              --image-retention 168
+
+
+  -h, --help
+
+      Show this help and exit.
+
+
+IMPORTANT BEHAVIOR
+
+  If neither --image-retention nor --stopped-retention is specified,
+  the script performs no cleanup and exits after displaying this help.
+
+  The two cleanup policies are independent.
+
+  Examples:
+
+    Only images:
+
+        docker-image-cleaner --image-retention 168
+
+    Only stopped containers:
+
+        docker-image-cleaner --stopped-retention 720
+
+    Both:
+
+        docker-image-cleaner \
+            --image-retention 168 \
+            --stopped-retention 720
+
+    Actually delete both:
+
+        docker-image-cleaner \
+            --delete \
+            --image-retention 168 \
+            --stopped-retention 720
+
+
+RECOMMENDED PRODUCTION USAGE
+
+    Keep unused images for 7 days
+    and stopped containers for 30 days:
+
+        docker-image-cleaner \
+            --delete \
+            --image-retention 168 \
+            --stopped-retention 720
+
+
+FILES
+
+    State:
+        /var/lib/docker-image-cleaner/state
+
+    Log:
+        /var/log/docker-image-cleaner.log
+
+    Lock:
+        /run/docker-image-cleaner.lock
+
+EOF
+}
+
+###############################################################################
+# Logging
+###############################################################################
+
+log() {
+    local level="$1"
+    shift
+
+    local message
+
+    message="$(
+        printf '[%s] [%s] %s' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" \
+            "$level" \
+            "$*"
+    )"
+
+    echo "$message" | tee -a "$LOG_FILE"
+}
+
+die() {
+    log ERROR "$*"
+    exit 1
+}
+
+###############################################################################
+# Argument parsing
+###############################################################################
+
+# Special behavior:
+# no arguments => show help and exit
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+
+    case "$1" in
+
+        --image-retention)
+
+            [[ $# -ge 2 ]] ||
+                die "--image-retention requires a number of hours"
+
+            IMAGE_RETENTION_HOURS="$2"
+
+            [[ "$IMAGE_RETENTION_HOURS" =~ ^[0-9]+$ ]] ||
+                die "--image-retention must be a non-negative integer number of hours"
+
+            shift
+            ;;
+
+        --stopped-retention)
+
+            [[ $# -ge 2 ]] ||
+                die "--stopped-retention requires a number of hours"
+
+            STOPPED_RETENTION_HOURS="$2"
+
+            [[ "$STOPPED_RETENTION_HOURS" =~ ^[0-9]+$ ]] ||
+                die "--stopped-retention must be a non-negative integer number of hours"
+
+            shift
+            ;;
+
+        --delete)
+
+            DRY_RUN=false
+            ;;
+
+        --dry-run)
+
+            DRY_RUN=true
+            ;;
+
+        -h|--help)
+
+            usage
+            exit 0
+            ;;
+
+        *)
+
+            usage >&2
+            echo >&2
+            die "Unknown option: $1"
+
+            ;;
+
+    esac
+
+    shift
+
+done
+
+###############################################################################
+# Nothing to do
+###############################################################################
+
+if [[ -z "$IMAGE_RETENTION_HOURS" &&
+      -z "$STOPPED_RETENTION_HOURS" ]]; then
+
+    usage
+    exit 0
+
+fi
+
+###############################################################################
+# Environment checks
+###############################################################################
+
+[[ "$EUID" -eq 0 ]] ||
+    die "This script must be run as root"
+
+command -v docker >/dev/null 2>&1 ||
+    die "docker command not found"
+
+command -v date >/dev/null 2>&1 ||
+    die "date command not found"
+
+command -v flock >/dev/null 2>&1 ||
+    die "flock command not found"
+
+command -v sort >/dev/null 2>&1 ||
+    die "sort command not found"
+
+command -v mktemp >/dev/null 2>&1 ||
+    die "mktemp command not found"
+
+docker info >/dev/null 2>&1 ||
+    die "Docker daemon is not available"
+
+###############################################################################
+# Directories / files
+###############################################################################
+
+mkdir -p "$STATE_DIR"
+
+touch "$STATE_FILE"
+touch "$LOG_FILE"
+
+chmod 600 "$STATE_FILE"
+
+###############################################################################
+# Lock
+###############################################################################
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+    die "Another docker-image-cleaner process is already running"
+fi
+
+###############################################################################
+# Temporary directory
+###############################################################################
+
+TMP_DIR="$(mktemp -d /tmp/docker-image-cleaner.XXXXXX)"
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+
+trap cleanup EXIT
+
+###############################################################################
+# Temporary files
+###############################################################################
+
+CURRENT_IMAGES="${TMP_DIR}/current-images"
+IMAGE_TAGS="${TMP_DIR}/image-tags"
+
+###############################################################################
+# Current time and cutoffs
+###############################################################################
+
+NOW="$(date +%s)"
+
+IMAGE_CUTOFF=""
+
+if [[ -n "$IMAGE_RETENTION_HOURS" ]]; then
+    IMAGE_CUTOFF=$(
+        (( NOW - IMAGE_RETENTION_HOURS * 3600 ))
+    )
+fi
+
+STOPPED_CUTOFF=""
+
+if [[ -n "$STOPPED_RETENTION_HOURS" ]]; then
+    STOPPED_CUTOFF=$(
+        (( NOW - STOPPED_RETENTION_HOURS * 3600 ))
+    )
+fi
+
+###############################################################################
+# Mode
+###############################################################################
+
+if "$DRY_RUN"; then
+    log INFO "Mode: DRY-RUN"
+else
+    log INFO "Mode: DELETE"
+fi
+
+if [[ -n "$IMAGE_RETENTION_HOURS" ]]; then
+    log INFO \
+        "Image retention: ${IMAGE_RETENTION_HOURS} hours"
+else
+    log INFO "Image cleanup: DISABLED"
+fi
+
+if [[ -n "$STOPPED_RETENTION_HOURS" ]]; then
+    log INFO \
+        "Stopped container retention: ${STOPPED_RETENTION_HOURS} hours"
+else
+    log INFO "Stopped container cleanup: DISABLED"
+fi
+
+###############################################################################
+# Persistent state
+#
+# Format:
+#
+#   sha256:<image-id> <unix-timestamp>
+#
+# The timestamp represents the last known time when the image was used
+# by a container.
+###############################################################################
+
+declare -A LAST_USED
+
+while read -r image_id timestamp; do
+
+    [[ -z "${image_id:-}" ]] && continue
+    [[ -z "${timestamp:-}" ]] && continue
+
+    LAST_USED["$image_id"]="$timestamp"
+
+done < "$STATE_FILE"
+
+###############################################################################
+# Get current images
+###############################################################################
+
+docker image ls \
+    --no-trunc \
+    --format '{{.ID}}' |
+    sort -u > "$CURRENT_IMAGES"
+
+IMAGE_COUNT="$(wc -l < "$CURRENT_IMAGES")"
+
+log INFO "Images found: ${IMAGE_COUNT}"
+
+###############################################################################
+# Get image tags
+###############################################################################
+
+docker image ls \
+    --no-trunc \
+    --format '{{.ID}}\t{{.Repository}}:{{.Tag}}' |
+    sort -u > "$IMAGE_TAGS"
+
+###############################################################################
+# Container bookkeeping
+###############################################################################
+
+declare -A IMAGE_REFERENCED
+declare -A IMAGE_RUNNING
+declare -A IMAGE_STOPPED
+
+declare -A IMAGE_LAST_USED
+
+declare -A CONTAINER_FINISHED
+
+CONTAINER_COUNT=0
+
+###############################################################################
+# Inspect all containers
+###############################################################################
+
+while read -r container_id; do
+
+    [[ -z "$container_id" ]] && continue
+
+    CONTAINER_COUNT=$((CONTAINER_COUNT + 1))
+
+    inspect="$(
+        docker inspect \
+            --format='{{.Id}}|{{.Image}}|{{.State.Running}}|{{.State.StartedAt}}|{{.State.FinishedAt}}|{{.Created}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Name}}' \
+            "$container_id" 2>/dev/null
+    )" || {
+        log WARN "Unable to inspect container ${container_id}"
+        continue
+    }
+
+    IFS='|' read -r \
+        full_container_id \
+        image_id \
+        running \
+        started_at \
+        finished_at \
+        created_at \
+        compose_project \
+        compose_service \
+        container_name <<< "$inspect"
+
+    [[ -n "${image_id:-}" ]] || continue
+
+    ###########################################################################
+    # Image reference
+    ###########################################################################
+
+    IMAGE_REFERENCED["$image_id"]=1
+
+    ###########################################################################
+    # Running / stopped
+    ###########################################################################
+
+    if [[ "$running" == "true" ]]; then
+        IMAGE_RUNNING["$image_id"]=1
+    else
+        IMAGE_STOPPED["$image_id"]=1
+    fi
+
+    ###########################################################################
+    # Last image usage
+    #
+    # The container's StartedAt is used as evidence that the image was used.
+    ###########################################################################
+
+    started_epoch=0
+
+    if [[ "$started_at" != "0001-01-01T00:00:00Z" &&
+          -n "$started_at" ]]; then
+
+        started_epoch="$(
+            date -d "$started_at" +%s 2>/dev/null || echo 0
+        )"
+
+    fi
+
+    if (( started_epoch > 0 )); then
+
+        old="${IMAGE_LAST_USED[$image_id]:-0}"
+
+        if (( started_epoch > old )); then
+            IMAGE_LAST_USED["$image_id"]="$started_epoch"
+        fi
+
+    fi
+
+    ###########################################################################
+    # Remember when stopped container finished
+    ###########################################################################
+
+    if [[ "$running" != "true" ]]; then
+
+        finished_epoch=0
+
+        if [[ "$finished_at" != "0001-01-01T00:00:00Z" &&
+              -n "$finished_at" ]]; then
+
+            finished_epoch="$(
+                date -d "$finished_at" +%s 2>/dev/null || echo 0
+            )"
+
+        fi
+
+        CONTAINER_FINISHED["$container_id"]="$finished_epoch"
+
+    fi
+
+done < <(docker ps -aq)
+
+log INFO "Containers found: ${CONTAINER_COUNT}"
+
+###############################################################################
+# Merge current image usage information into persistent state
+###############################################################################
+
+for image_id in "${!IMAGE_LAST_USED[@]}"; do
+
+    current="${IMAGE_LAST_USED[$image_id]}"
+    old="${LAST_USED[$image_id]:-0}"
+
+    if (( current > old )); then
+        LAST_USED["$image_id"]="$current"
+    fi
+
+done
+
+###############################################################################
+# Initialize previously unknown images with their creation time.
+#
+# This is conservative:
+# an image that has never been observed by this script will not immediately
+# become eligible for deletion.
+###############################################################################
+
+while read -r image_id; do
+
+    [[ -z "$image_id" ]] && continue
+
+    if [[ -z "${LAST_USED[$image_id]:-}" ]]; then
+
+        created="$(
+            docker image inspect \
+                --format='{{.Created}}' \
+                "$image_id" 2>/dev/null || true
+        )"
+
+        created_epoch=0
+
+        if [[ -n "$created" ]]; then
+
+            created_epoch="$(
+                date -d "$created" +%s 2>/dev/null || echo 0
+            )"
+
+        fi
+
+        if (( created_epoch > 0 )); then
+            LAST_USED["$image_id"]="$created_epoch"
+        else
+            LAST_USED["$image_id"]="$NOW"
+        fi
+
+    fi
+
+done < "$CURRENT_IMAGES"
+
+###############################################################################
+# Save state atomically
+###############################################################################
+
+NEW_STATE="${TMP_DIR}/state.new"
+
+: > "$NEW_STATE"
+
+for image_id in "${!LAST_USED[@]}"; do
+
+    printf '%s %s\n' \
+        "$image_id" \
+        "${LAST_USED[$image_id]}" \
+        >> "$NEW_STATE"
+
+done
+
+chmod 600 "$NEW_STATE"
+
+mv "$NEW_STATE" "$STATE_FILE"
+
+###############################################################################
+# Helpers
+###############################################################################
+
+get_tags() {
+
+    local image_id="$1"
+
+    awk -F '\t' \
+        -v id="$image_id" \
+        '$1 == id {print $2}' \
+        "$IMAGE_TAGS" |
+        paste -sd ',' -
+
+}
+
+format_age() {
+
+    local timestamp="$1"
+
+    local seconds
+
+    seconds=$((NOW - timestamp))
+
+    (( seconds < 0 )) && seconds=0
+
+    printf '%dh %02dm %02ds' \
+        "$((seconds / 3600))" \
+        "$(((seconds % 3600) / 60))" \
+        "$((seconds % 60))"
+
+}
+
+###############################################################################
+# Remove old stopped containers
+###############################################################################
+
+STOPPED_CANDIDATES=0
+STOPPED_REMOVED=0
+STOPPED_FAILED=0
+
+if [[ -n "$STOPPED_RETENTION_HOURS" ]]; then
+
+    log INFO "Scanning stopped containers..."
+
+    while read -r container_id; do
+
+        [[ -z "$container_id" ]] && continue
+
+        inspect="$(
+            docker inspect \
+                --format='{{.Id}}|{{.Image}}|{{.State.Running}}|{{.State.FinishedAt}}|{{.Created}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Name}}' \
+                "$container_id" 2>/dev/null
+        )" || {
+            log WARN "Unable to inspect container ${container_id}"
+            continue
+        }
+
+        IFS='|' read -r \
+            full_container_id \
+            image_id \
+            running \
+            finished_at \
+            created_at \
+            compose_project \
+            compose_service \
+            container_name <<< "$inspect"
+
+        #######################################################################
+        # Never remove running containers
+        #######################################################################
+
+        [[ "$running" == "true" ]] && continue
+
+        #######################################################################
+        # Determine when container stopped.
+        #
+        # FinishedAt is preferred.
+        # CreatedAt is fallback for a container that has never been started.
+        #######################################################################
+
+        reference_epoch=0
+
+        if [[ "$finished_at" != "0001-01-01T00:00:00Z" &&
+              -n "$finished_at" ]]; then
+
+            reference_epoch="$(
+                date -d "$finished_at" +%s 2>/dev/null || echo 0
+            )"
+
+        fi
+
+        if (( reference_epoch == 0 )); then
+
+            reference_epoch="$(
+                date -d "$created_at" +%s 2>/dev/null || echo 0
+            )"
+
+        fi
+
+        if (( reference_epoch == 0 )); then
+
+            log WARN \
+                "Cannot determine age of stopped container ${container_name}"
+
+            continue
+
+        fi
+
+        #######################################################################
+        # Retention check
+        #######################################################################
+
+        if (( reference_epoch >= STOPPED_CUTOFF )); then
+            continue
+        fi
+
+        STOPPED_CANDIDATES=$((STOPPED_CANDIDATES + 1))
+
+        age="$(format_age "$reference_epoch")"
+
+        compose_info=""
+
+        if [[ "$compose_project" != "<no value>" &&
+              -n "$compose_project" ]]; then
+
+            compose_info+=" compose_project=${compose_project}"
+
+        fi
+
+        if [[ "$compose_service" != "<no value>" &&
+              -n "$compose_service" ]]; then
+
+            compose_info+=" compose_service=${compose_service}"
+
+        fi
+
+        log INFO \
+            "Stopped container candidate: " \
+            "${container_name} " \
+            "image=${image_id} " \
+            "age=${age}${compose_info}"
+
+        #######################################################################
+        # Dry-run
+        #######################################################################
+
+        if "$DRY_RUN"; then
+            continue
+        fi
+
+        #######################################################################
+        # Delete
+        #######################################################################
+
+        if docker rm "$container_id" >/dev/null; then
+
+            STOPPED_REMOVED=$((STOPPED_REMOVED + 1))
+
+            log INFO \
+                "Removed stopped container: ${container_name}"
+
+        else
+
+            STOPPED_FAILED=$((STOPPED_FAILED + 1))
+
+            log WARN \
+                "Failed to remove stopped container: ${container_name}"
+
+        fi
+
+    done < <(docker ps -aq)
+
+else
+
+    log INFO \
+        "Stopped container cleanup not requested"
+
+fi
+
+###############################################################################
+# Image cleanup
+###############################################################################
+
+IMAGE_CANDIDATES=0
+IMAGE_REMOVED=0
+IMAGE_FAILED=0
+
+if [[ -n "$IMAGE_RETENTION_HOURS" ]]; then
+
+    log INFO "Scanning images..."
+
+    ###########################################################################
+    # IMPORTANT:
+    #
+    # Re-read container references AFTER stopped container cleanup.
+    #
+    # This allows an image to become eligible immediately after its old
+    # stopped container has been removed.
+    ###########################################################################
+
+    declare -A CURRENT_IMAGE_REFERENCES
+    declare -A CURRENT_RUNNING_REFERENCES
+
+    while read -r container_id; do
+
+        [[ -z "$container_id" ]] && continue
+
+        inspect="$(
+            docker inspect \
+                --format='{{.Image}}|{{.State.Running}}' \
+                "$container_id" 2>/dev/null
+        )" || continue
+
+        IFS='|' read -r image_id running <<< "$inspect"
+
+        [[ -n "${image_id:-}" ]] || continue
+
+        CURRENT_IMAGE_REFERENCES["$image_id"]=1
+
+        if [[ "$running" == "true" ]]; then
+            CURRENT_RUNNING_REFERENCES["$image_id"]=1
+        fi
+
+    done < <(docker ps -aq)
+
+    ###########################################################################
+    # Scan images
+    ###########################################################################
+
+    while read -r image_id; do
+
+        [[ -z "$image_id" ]] && continue
+
+        #######################################################################
+        # Never remove an image used by a running container
+        #######################################################################
+
+        if [[ -n "${CURRENT_RUNNING_REFERENCES[$image_id]:-}" ]]; then
+            continue
+        fi
+
+        #######################################################################
+        # Never remove an image referenced by ANY container
+        #
+        # This includes stopped containers that survived their retention
+        # period because --stopped-retention was not specified.
+        #######################################################################
+
+        if [[ -n "${CURRENT_IMAGE_REFERENCES[$image_id]:-}" ]]; then
+            continue
+        fi
+
+        #######################################################################
+        # Last known use
+        #######################################################################
+
+        last_used="${LAST_USED[$image_id]:-$NOW}"
+
+        #######################################################################
+        # Retention check
+        #######################################################################
+
+        if (( last_used >= IMAGE_CUTOFF )); then
+            continue
+        fi
+
+        #######################################################################
+        # Candidate
+        #######################################################################
+
+        IMAGE_CANDIDATES=$((IMAGE_CANDIDATES + 1))
+
+        tags="$(get_tags "$image_id")"
+
+        [[ -n "$tags" ]] ||
+            tags="<none>"
+
+        age="$(format_age "$last_used")"
+
+        log INFO \
+            "Image candidate: " \
+            "${image_id} " \
+            "tags=${tags} " \
+            "last_used_age=${age}"
+
+        #######################################################################
+        # Dry-run
+        #######################################################################
+
+        if "$DRY_RUN"; then
+            continue
+        fi
+
+        #######################################################################
+        # Delete
+        #######################################################################
+
+        if docker image rm "$image_id" >/dev/null; then
+
+            IMAGE_REMOVED=$((IMAGE_REMOVED + 1))
+
+            log INFO \
+                "Removed image: ${image_id} (${tags})"
+
+        else
+
+            IMAGE_FAILED=$((IMAGE_FAILED + 1))
+
+            log WARN \
+                "Failed to remove image: ${image_id} (${tags})"
+
+        fi
+
+    done < "$CURRENT_IMAGES"
+
+else
+
+    log INFO \
+        "Image cleanup not requested"
+
+fi
+
+###############################################################################
+# Summary
+###############################################################################
+
+log INFO "========================================"
+log INFO "Docker image cleaner summary"
+log INFO "========================================"
+
+log INFO \
+    "Images found: ${IMAGE_COUNT}"
+
+log INFO \
+    "Containers found: ${CONTAINER_COUNT}"
+
+log INFO \
+    "Stopped container candidates: ${STOPPED_CANDIDATES}"
+
+if "$DRY_RUN"; then
+
+    log INFO \
+        "Stopped containers removed: 0 (dry-run)"
+
+else
+
+    log INFO \
+        "Stopped containers removed: ${STOPPED_REMOVED}"
+
+    log INFO \
+        "Stopped container failures: ${STOPPED_FAILED}"
+
+fi
+
+log INFO \
+    "Image candidates: ${IMAGE_CANDIDATES}"
+
+if "$DRY_RUN"; then
+
+    log INFO \
+        "Images removed: 0 (dry-run)"
+
+else
+
+    log INFO \
+        "Images removed: ${IMAGE_REMOVED}"
+
+    log INFO \
+        "Image removal failures: ${IMAGE_FAILED}"
+
+fi
+
+log INFO "Finished"

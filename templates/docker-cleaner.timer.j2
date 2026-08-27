@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Docker cleaner
+
+[Timer]
+OnCalendar={{ docker_cleaner_on_calendar }}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
