@@ -457,8 +457,6 @@ docker image ls \
 
 IMAGE_COUNT="$(wc -l < "$CURRENT_IMAGES")"
 
-log INFO "Images found: ${IMAGE_COUNT}"
-
 ###############################################################################
 # Get image tags
 ###############################################################################
@@ -579,8 +577,6 @@ while read -r container_id; do
     fi
 
 done < <(docker ps -aq)
-
-log INFO "Containers found: ${CONTAINER_COUNT}"
 
 ###############################################################################
 # Merge current image usage information into persistent state
