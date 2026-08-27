@@ -5,6 +5,10 @@ After=docker.service
 
 [Service]
 Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=10%
+IOWeight=1
 ExecStart=/usr/local/bin/docker-cleaner \
     --delete \
     --image-retention 168 \
